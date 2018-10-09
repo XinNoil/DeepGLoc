@@ -38,12 +38,13 @@ class BaseModel(metaclass=ABCMeta):
             self.save = False
 
         if 'output' not in kwargs:
-            self.output = 'output'
+            self.output = 'tmp'
         else:
             self.output = kwargs['output']
 
-        if not os.path.isdir(self.output):
-            os.mkdir(self.output)
+        self.out_dir = os.path.join('output',self.output)
+        if not os.path.isdir(self.out_dir):
+            os.mkdir(self.out_dir)
 
         self.trainers = {}
     
@@ -51,14 +52,10 @@ class BaseModel(metaclass=ABCMeta):
         '''
         Main learning loop
         '''
-        # Create output directories if not exist
-        out_dir = os.path.join(self.output, self.name)
-        if not os.path.isdir(out_dir):
-            os.mkdir(out_dir)
-
         # Start training
         print('\n\n--- START TRAINING ---\n\n')
         num_data = len(datasets)
+        self.on_train_begin()
         for e in range(epochs):
             perm = np.random.permutation(num_data)
             start_time = time.time()
@@ -75,7 +72,7 @@ class BaseModel(metaclass=ABCMeta):
                 # Get batch and train on it
                 x_batch = self.make_batch(datasets, indx)
                 losses = self.train_on_batch(x_batch)
-                self.report_losses(reporter, losses)
+                self.report_logs(reporter, losses)
 
                 # Compute ETA
                 elapsed_time = time.time() - start_time
@@ -83,23 +80,25 @@ class BaseModel(metaclass=ABCMeta):
                 print('| ETA: %s ' % utils.time_format(eta), end='')
 
                 sys.stdout.flush()
-            
-            print('')
+            train_logs=self.train_on_batch(datasets.get_training())
+            val_logs=[]
             if validation:
-                losses = self.train_on_batch(datasets.get_validation())
+                val_logs = self.train_on_batch(datasets.get_validation())
                 print('\tvalidation ', end='')
-                self.report_losses(reporter,losses)
+                self.report_logs(reporter,val_logs)
                 print('\n')
+            _logs=(train_logs,val_logs)
+            self.on_epoch_end(e,_logs)
 
-    def save_model(self, out_dir):
+    def get_filename(self,prefix,filename,ext):
+        return os.path.join(self.out_dir, '%s_%s.%s' % (prefix,filename,ext))
+
+    def save_model(self):
         if not self.save:
             return
 
-        if not os.path.isdir(out_dir):
-            os.mkdir(out_dir)
-
         for k, v in self.trainers.items():
-            filename = os.path.join(out_dir, '%s.hdf5' % (k))
+            filename = os.path.join(self.out_dir, '%s.hdf5' % (k))
             v.save_weights(filename)
 
     def store_to_save(self, name):
@@ -110,10 +109,24 @@ class BaseModel(metaclass=ABCMeta):
             filename = os.path.join(folder, '%s.hdf5' % (k))
             getattr(self, k).load_weights(filename)
     
-    def report_losses(self, reporter, losses):
+    def report_logs(self, reporter, losses):
         for k in reporter:
                 if k in losses:
                     print('| %s = %8.6f ' % (k, losses[k]), end='')
+
+    @abstractmethod
+    def on_train_begin(self):
+        '''
+        Plase override "on_train_begin" method in the derived model!
+        '''
+        pass
+
+    @abstractmethod
+    def on_epoch_end(self, epoch, _logs):
+        '''
+        Plase override "on_epoch_end" method in the derived model!
+        '''
+        pass
 
     @abstractmethod
     def make_batch(self, datasets, indx):
@@ -160,6 +173,14 @@ class BaseDNN(BaseModel):
         dnn.summary()
         
         return dnn
+    
+    def on_train_begin(self):
+        self.logs = {'train':[], 'val':[]}
+
+    def on_epoch_end(self, epoch, _logs):
+        train_logs, val_logs = _logs
+        self.logs['train'].append(train_logs['loss'])
+        self.logs['val'].append(val_logs['loss'])
 
     def make_batch(self, datasets, indx):
         x_true = datasets.train_features[indx]
@@ -220,6 +241,14 @@ class VAE(BaseModel):
         x = Dense(self.input_shape[0])(x)
         return Model(inputs, x)
     
+    def on_train_begin(self):
+        self.logs = {'train':[], 'val':[]}
+
+    def on_epoch_end(self, epoch, _logs):
+        train_logs, val_logs = _logs
+        self.logs['train'].append(train_logs['loss'])
+        self.logs['val'].append(val_logs['loss'])
+
     def make_batch(self, datasets, indx):
         x_true = datasets.train_features[indx]
         return x_true
@@ -239,7 +268,7 @@ class VAE(BaseModel):
         return self.f_dec.predict(z_sample)
 
 class CVAE(BaseModel):
-    def __init__(self, name='vae', layer_units=[128,64], y_dims=2, z_dims=16, **kwargs):
+    def __init__(self, name='cvae', layer_units=[128,64], y_dims=2, z_dims=16, **kwargs):
         super(CVAE, self).__init__(name=name, **kwargs)
         self.layer_units = layer_units
         self.y_dims = y_dims
@@ -290,6 +319,14 @@ class CVAE(BaseModel):
         x = Dense(self.input_shape[0])(x)
         return Model([z,y_true], x)
     
+    def on_train_begin(self):
+        self.logs = {'train':[], 'val':[]}
+
+    def on_epoch_end(self, epoch, _logs):
+        train_logs, val_logs = _logs
+        self.logs['train'].append(train_logs['loss'])
+        self.logs['val'].append(val_logs['loss'])
+
     def make_batch(self, datasets, indx):
         x_true = datasets.train_features[indx]
         y_true = datasets.train_labels[indx]
@@ -304,9 +341,94 @@ class CVAE(BaseModel):
     def predict(self, xy_data):
         return self.cvae_trainer.predict(xy_data)
 
-    def encode(xy_data):
+    def encode(self, xy_data):
         return self.f_enc.predict(xy_data)
     
-    def decode(zy_sample):
+    def decode(self, zy_sample):
         return self.f_dec.predict(zy_sample)
 
+    def decodey(self, y, resample_num=1):
+        y_sample = y.repeat(resample_num,axis=0)
+        z_sample = np.random.standard_normal((y_sample.shape[0],self.z_dims))
+        return self.decode([z_sample,y_sample]),y_sample
+
+class CVAER(BaseModel):
+    def __init__(self, name='cvaer', layer_units=[128,64], y_dims=2, z_dims=16, **kwargs):
+        super(CVAE, self).__init__(name=name, **kwargs)
+        self.layer_units = layer_units
+        self.y_dims = y_dims
+        self.z_dims = z_dims
+
+        self.f_enc = self.build_encoder()
+        self.f_dec = self.build_decoder()
+        self.f_reg = self.build_regressor()
+        self.cvaer_trainer = self.build_model()
+        self.store_to_save('cvaer_trainer')
+    
+    def build_model(self):
+        x_true = Input(shape=self.input_shape)
+        y_true = Input(shape=(self.y_dims,))
+        z_avg, z_log_var = self.f_enc([x_true,y_true])
+        z = layers.SampleNormal()([z_avg, z_log_var])
+        x_pred = self.f_dec([z,y_true])
+        y_pred = self.f_reg(x_true)
+        vaer_loss = layers.VAERLossLayer()([x_true, x_pred, z_avg, z_log_var, y_true, y_pred])
+
+        cvae_trainer = Model(inputs=[x_true,y_true], outputs=[vae_loss])
+        cvae_trainer.compile(loss=[utils.zero_loss], optimizer=Adam(lr=2.0e-4, beta_1=0.5))
+        cvae_trainer.summary()
+        return cvae_trainer
+    
+    def build_encoder(self):
+        x_true = Input(shape=self.input_shape)
+        y_true = Input(shape=(self.y_dims,))
+        inputs=keras.layers.concatenate([x_true, y_true])
+        x = Dense(self.layer_units[0], kernel_initializer='uniform', activation='relu')(inputs)
+        for n in self.layer_units[1:]:
+            x = Dense(n, kernel_initializer='uniform', activation='relu')(x)
+        z_avg = Dense(self.z_dims)(x)
+        z_log_var = Dense(self.z_dims)(x)
+
+        z_avg = Activation('linear')(z_avg)
+        z_log_var = Activation('linear')(z_log_var)
+        encoder = Model([x_true,y_true], [z_avg, z_log_var])
+        return encoder
+
+    def build_decoder(self):
+        layer_units=self.layer_units.copy()
+        layer_units.reverse()
+        z = Input(shape=(self.z_dims,))
+        y_true = Input(shape=(self.y_dims,))
+        inputs=keras.layers.concatenate([z, y_true])
+        x = Dense(layer_units[0], kernel_initializer='uniform', activation='relu')(inputs)
+        for n in layer_units[1:]:
+            x = Dense(n, kernel_initializer='uniform', activation='relu')(x)
+        x = Dense(self.input_shape[0])(x)
+        return Model([z,y_true], x)
+    
+    def make_batch(self, datasets, indx):
+        x_true = datasets.train_features[indx]
+        y_true = datasets.train_labels[indx]
+        return [x_true,y_true]
+
+    def train_on_batch(self, batch):
+        x_true,y_true = batch
+        xy_true = [x_true,y_true]
+        loss = self.cvae_trainer.train_on_batch(xy_true,x_true)
+        return { 'loss': loss }
+
+    def predict(self, xy_data):
+        return self.cvae_trainer.predict(xy_data)
+
+    def encode(self, xy_data):
+        return self.f_enc.predict(xy_data)
+    
+    def decode(self, zy_sample):
+        return self.f_dec.predict(zy_sample)
+
+models = {
+    'dnn': BaseDNN,
+    'vae': VAE,
+    'cvae': CVAE,
+    'cvaer': CVAER
+}

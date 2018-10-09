@@ -39,3 +39,29 @@ class VAELossLayer(Layer):
         self.add_loss(loss, inputs=inputs)
 
         return x_true
+
+class VAERLossLayer(Layer):
+    __name__ = 'vaer_loss_layer'
+
+    def __init__(self, **kwargs):
+        self.is_placeholder = True
+        self.alpha = kwargs['alpha']
+        super(VAERLossLayer, self).__init__(**kwargs)
+
+    def lossfun(self, x_true, x_pred, z_avg, z_log_var, y_true, y_pred):
+        rec_loss = K.mean(K.square(x_true - x_pred))
+        kl_loss = K.mean(-0.5 * K.sum(1.0 + z_log_var - K.square(z_avg) - K.exp(z_log_var), axis=-1))
+        ed_loss = K.sqrt(K.sum(K.square(y_pred - y_true), axis=-1))
+        return rec_loss + kl_loss + self.alpha*ed_loss
+
+    def call(self, inputs):
+        x_true = inputs[0]
+        x_pred = inputs[1]
+        z_avg = inputs[2]
+        z_log_var = inputs[3]
+        y_true = inputs[4]
+        y_pred = inputs[5]
+        loss = self.lossfun(x_true, x_pred, z_avg, z_log_var, y_true, y_pred)
+        self.add_loss(loss, inputs=inputs)
+
+        return x_true
